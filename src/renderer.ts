@@ -31,7 +31,7 @@ function loadBombImage(): void {
     bgHeight = 0
     invalidateRestCache()
   }
-  bombImg.src = '/bomb.png'
+  bombImg.src = import.meta.env.BASE_URL + 'bomb.png'
 }
 
 loadBombImage()
