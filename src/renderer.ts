@@ -26,10 +26,8 @@ function loadBombImage(): void {
   bombImg = new Image()
   bombImg.onload = () => {
     bombImgLoaded = true
-    // Force bg re-render
     bgWidth = 0
     bgHeight = 0
-    invalidateRestCache()
   }
   bombImg.src = import.meta.env.BASE_URL + 'bomb.png'
 }
@@ -109,9 +107,9 @@ export type Spark = {
   alive: boolean
 }
 
-export function createDetonationSparks(bombX: number, bombY: number, count: number): Spark[] {
-  const sparks: Spark[] = []
-  const colors = ['#ffcc00', '#ff8800', '#ff4400', '#ffffff', '#ffaa22']
+const SPARK_COLORS = ['#ffcc00', '#ff8800', '#ff4400', '#ffffff', '#ffaa22']
+
+export function pushDetonationSparks(sparks: Spark[], bombX: number, bombY: number, count: number): void {
   for (let i = 0; i < count; i++) {
     const angle = Math.random() * Math.PI * 2
     const speed = 100 + Math.random() * 400
@@ -124,15 +122,13 @@ export function createDetonationSparks(bombX: number, bombY: number, count: numb
       life,
       maxLife: life,
       size: 1.5 + Math.random() * 3,
-      color: colors[Math.floor(Math.random() * colors.length)]!,
+      color: SPARK_COLORS[(i % 5)]!,
       alive: true,
     })
   }
-  return sparks
 }
 
-export function createFuseSparks(x: number, y: number): Spark[] {
-  const sparks: Spark[] = []
+export function pushFuseSparks(sparks: Spark[], x: number, y: number): void {
   const count = 2 + Math.floor(Math.random() * 3)
   for (let i = 0; i < count; i++) {
     const angle = Math.random() * Math.PI * 2
@@ -149,11 +145,10 @@ export function createFuseSparks(x: number, y: number): Spark[] {
       alive: true,
     })
   }
-  return sparks
 }
 
 export function updateSparks(sparks: Spark[], dt: number): void {
-  // Update all sparks
+  let write = 0
   for (let i = 0; i < sparks.length; i++) {
     const s = sparks[i]!
     s.x += s.vx * dt
@@ -161,13 +156,8 @@ export function updateSparks(sparks: Spark[], dt: number): void {
     s.vy += 300 * dt
     s.vx *= 0.98
     s.life -= dt * 1000
-    if (s.life <= 0) s.alive = false
-  }
-  // Swap-remove dead sparks (avoids O(n) splice shifts)
-  let write = 0
-  for (let read = 0; read < sparks.length; read++) {
-    if (sparks[read]!.alive) {
-      sparks[write] = sparks[read]!
+    if (s.life > 0) {
+      sparks[write] = s
       write++
     }
   }
@@ -183,7 +173,10 @@ let restHeight = 0
 
 export function invalidateRestCache(): void {
   restDirty = true
-  // Also reset bg cache so it re-renders at new size
+}
+
+export function invalidateAllCaches(): void {
+  restDirty = true
   bgWidth = 0
   bgHeight = 0
 }
@@ -260,6 +253,7 @@ export function render(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
   particles: CharParticle[],
+  activeIndices: number[],
   bombs: Bomb[],
   sparks: Spark[],
   shake: ScreenShake | null,
@@ -267,11 +261,10 @@ export function render(
   lineHeight: number,
   now: number,
   hasActivity: boolean,
+  dpr: number,
 ): void {
   // Skip full redraw if completely idle
   if (!hasActivity && !restDirty) return
-
-  const dpr = window.devicePixelRatio || 1
 
   ctx.save()
 
@@ -285,7 +278,7 @@ export function render(
     ctx.translate(sx * dpr, sy * dpr)
   }
 
-  // Draw background
+  // Draw background (cached — only re-renders on resize)
   renderBackground(canvas.width, canvas.height, dpr)
   if (bgCanvas) {
     ctx.drawImage(bgCanvas, 0, 0)
@@ -297,39 +290,60 @@ export function render(
     ctx.drawImage(restCanvas, 0, 0)
   }
 
-  // Draw animated characters only
-  ctx.font = font
-  ctx.textBaseline = 'top'
+  // Draw animated characters only — using activeIndices to skip rest particles
+  if (activeIndices.length > 0) {
+    ctx.font = font
+    ctx.textBaseline = 'top'
 
-  for (const p of particles) {
-    if (p.state === 'rest') continue
-    if (p.opacity <= 0.01) continue
+    const halfLH = (lineHeight * dpr) / 2
+    // Capture the current (possibly shaken) transform as our base
+    const baseTransform = ctx.getTransform()
 
-    const color = p.state === 'shrapnel' ? CHAR_COLORS.shrapnel : CHAR_COLORS.reassembling
-    const centerX = p.cx * dpr + (p.info.width * dpr) / 2
-    const centerY = p.cy * dpr + (lineHeight * dpr) / 2
+    for (let i = 0; i < activeIndices.length; i++) {
+      const p = particles[activeIndices[i]!]!
+      if (p.opacity <= 0.01) continue
 
-    ctx.save()
-    ctx.globalAlpha = p.opacity
-    ctx.translate(centerX, centerY)
-    ctx.rotate(p.rotation)
-    ctx.fillStyle = color
-    ctx.fillText(p.info.char, -(p.info.width * dpr) / 2, -(lineHeight * dpr) / 2)
-    ctx.restore()
+      const hw = (p.info.width * dpr) / 2
+      const centerX = p.cx * dpr + hw
+      const centerY = p.cy * dpr + halfLH
+
+      // Use setTransform to apply rotation directly — avoids save/restore per char
+      const cos = Math.cos(p.rotation)
+      const sin = Math.sin(p.rotation)
+      ctx.setTransform(
+        baseTransform.a * cos + baseTransform.c * sin,
+        baseTransform.b * cos + baseTransform.d * sin,
+        baseTransform.a * -sin + baseTransform.c * cos,
+        baseTransform.b * -sin + baseTransform.d * cos,
+        baseTransform.a * centerX + baseTransform.c * centerY + baseTransform.e,
+        baseTransform.b * centerX + baseTransform.d * centerY + baseTransform.f,
+      )
+
+      ctx.globalAlpha = p.opacity
+      ctx.fillStyle = p.state === 'shrapnel' ? CHAR_COLORS.shrapnel : CHAR_COLORS.reassembling
+      ctx.fillText(p.info.char, -hw, -halfLH)
+    }
+
+    // Restore base transform
+    ctx.setTransform(baseTransform)
+    ctx.globalAlpha = 1
   }
 
   // Draw bombs
-  ctx.save()
-  ctx.scale(dpr, dpr)
-  for (const bomb of bombs) {
-    drawBomb(ctx, bomb, now)
+  if (bombs.length > 0) {
+    ctx.save()
+    ctx.scale(dpr, dpr)
+    for (const bomb of bombs) {
+      drawBomb(ctx, bomb, now)
+    }
+    ctx.restore()
   }
-  ctx.restore()
 
   // Draw sparks
   if (sparks.length > 0) {
-    for (const s of sparks) {
-      const alpha = Math.max(0, s.life / s.maxLife)
+    for (let i = 0; i < sparks.length; i++) {
+      const s = sparks[i]!
+      const alpha = s.life / s.maxLife
       ctx.globalAlpha = alpha
       ctx.beginPath()
       ctx.arc(s.x * dpr, s.y * dpr, s.size * dpr, 0, Math.PI * 2)

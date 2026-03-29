@@ -1,10 +1,11 @@
 import { computeCharPositions } from './text-layout'
 import { createBomb, updateBomb, type Bomb } from './bomb'
-import { createParticle, detonateChar, updateParticle, type CharParticle } from './physics'
+import { createParticle, detonateChars, updateActiveParticles, type CharParticle } from './physics'
 import {
-  createDetonationSparks,
-  createFuseSparks,
   invalidateRestCache,
+  invalidateAllCaches,
+  pushDetonationSparks,
+  pushFuseSparks,
   render,
   updateSparks,
   type ScreenShake,
@@ -36,19 +37,21 @@ const canvas = document.getElementById('canvas') as HTMLCanvasElement
 const ctx = canvas.getContext('2d')!
 
 let particles: CharParticle[] = []
+let activeIndices: number[] = [] // Indices of non-rest particles
 let bombs: Bomb[] = []
 let sparks: Spark[] = []
 let shake: ScreenShake | null = null
 let lastTime = 0
 let canvasHeight = 0
+let cachedDpr = window.devicePixelRatio || 1
 
 function setupCanvas(): void {
-  const dpr = window.devicePixelRatio || 1
-  canvas.width = window.innerWidth * dpr
-  canvas.height = canvasHeight * dpr
+  cachedDpr = window.devicePixelRatio || 1
+  canvas.width = window.innerWidth * cachedDpr
+  canvas.height = canvasHeight * cachedDpr
   canvas.style.width = window.innerWidth + 'px'
   canvas.style.height = canvasHeight + 'px'
-  ctx.font = `${FONT_SIZE * dpr}px "Georgia", "Times New Roman", serif`
+  ctx.font = `${FONT_SIZE * cachedDpr}px "Georgia", "Times New Roman", serif`
 }
 
 function layoutText(): void {
@@ -61,7 +64,7 @@ function layoutText(): void {
   // Size canvas to fit all text + padding
   canvasHeight = Math.max(window.innerHeight, totalHeight + offsetY + PADDING)
   setupCanvas()
-  invalidateRestCache()
+  invalidateAllCaches()
 
   // Preserve state of existing particles if relayout
   const oldParticleMap = new Map<string, CharParticle>()
@@ -79,6 +82,14 @@ function layoutText(): void {
     }
     return createParticle(info)
   })
+
+  // Rebuild active indices
+  activeIndices = []
+  for (let i = 0; i < particles.length; i++) {
+    if (particles[i]!.state !== 'rest') {
+      activeIndices.push(i)
+    }
+  }
 }
 
 function handleClick(e: MouseEvent): void {
@@ -94,7 +105,7 @@ function gameLoop(timestamp: number): void {
   lastTime = timestamp
   const now = performance.now()
 
-  let animatingCount = 0
+  let restCacheDirty = false
 
   // Update bombs
   for (let i = bombs.length - 1; i >= 0; i--) {
@@ -104,12 +115,10 @@ function gameLoop(timestamp: number): void {
 
     // On detonation trigger
     if (prevState === 'fuse' && bomb.state === 'detonating') {
-      for (const p of particles) {
-        detonateChar(p, bomb.x, bomb.y, bomb.blastRadius, now)
-      }
+      const count = detonateChars(particles, activeIndices, bomb.x, bomb.y, bomb.blastRadius, now)
+      if (count > 0) restCacheDirty = true
       shake = { startTime: now, duration: 400, intensity: 12 }
-      sparks.push(...createDetonationSparks(bomb.x, bomb.y, 80))
-      invalidateRestCache()
+      pushDetonationSparks(sparks, bomb.x, bomb.y, 80)
     }
 
     // Fuse sparks
@@ -125,7 +134,7 @@ function gameLoop(timestamp: number): void {
       const fex = fx + Math.cos(fuseAngle) * fuseLen
       const fey = fy + Math.sin(fuseAngle) * fuseLen
       if (Math.random() < 0.3) {
-        sparks.push(...createFuseSparks(fex, fey))
+        pushFuseSparks(sparks, fex, fey)
       }
     }
 
@@ -134,27 +143,20 @@ function gameLoop(timestamp: number): void {
     }
   }
 
-  // Update particles — track how many are animating
-  for (const p of particles) {
-    const prevState = p.state
-    updateParticle(p, dt, now)
-    if (p.state !== 'rest') {
-      animatingCount++
-    }
-    // Char just returned to rest — rest cache needs update
-    if (prevState !== 'rest' && p.state === 'rest') {
-      invalidateRestCache()
-    }
-  }
+  // Update only active particles
+  const anyReturnedToRest = updateActiveParticles(particles, activeIndices, dt, now)
+  if (anyReturnedToRest) restCacheDirty = true
+
+  // Batch rest cache invalidation — once per frame, not per particle
+  if (restCacheDirty) invalidateRestCache()
 
   updateSparks(sparks, dt)
 
   const shakeActive = shake !== null && now - shake.startTime < shake.duration
-  const hasActivity = animatingCount > 0 || bombs.length > 0 || sparks.length > 0 || shakeActive
+  const hasActivity = activeIndices.length > 0 || bombs.length > 0 || sparks.length > 0 || shakeActive
 
-  const dpr = window.devicePixelRatio || 1
-  const scaledFont = `${FONT_SIZE * dpr}px "Georgia", "Times New Roman", serif`
-  render(ctx, canvas, particles, bombs, sparks, shake, scaledFont, LINE_HEIGHT, now, hasActivity)
+  const scaledFont = `${FONT_SIZE * cachedDpr}px "Georgia", "Times New Roman", serif`
+  render(ctx, canvas, particles, activeIndices, bombs, sparks, shake, scaledFont, LINE_HEIGHT, now, hasActivity, cachedDpr)
 
   requestAnimationFrame(gameLoop)
 }
